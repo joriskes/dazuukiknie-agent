@@ -1,51 +1,38 @@
-/**
-Todo joris:
-- Append to json instead of create new
-- Login / connect to dazuukiknie.nl
-- Send to dazuukiknie.nl
-*/
-
 package main
 
 import (
 	"encoding/json"
-	"fmt"
 	"github.com/lxn/walk"
 	"log"
 	"os"
 	"path/filepath"
 	"syscall"
 	"time"
-	"unsafe"
 )
 
 // Windows API functions
 var (
-	user32                  = syscall.NewLazyDLL("user32.dll")
-	procGetForegroundWindow = user32.NewProc("GetForegroundWindow")
-	procGetWindowTextW      = user32.NewProc("GetWindowTextW")
+	user32                       = syscall.NewLazyDLL("user32.dll")
+	kernel32                     = syscall.NewLazyDLL("kernel32.dll")
+	procGetForegroundWindow      = user32.NewProc("GetForegroundWindow")
+	procGetWindowTextW           = user32.NewProc("GetWindowTextW")
+	procGetWindowThreadProcessId = user32.NewProc("GetWindowThreadProcessId")
+	procOpenProcess              = kernel32.NewProc("OpenProcess")
+	procGetModuleFileNameExW     = kernel32.NewProc("K32GetModuleFileNameExW")
 )
 
 // Struct for JSON serialization
 type AppUsageEntry struct {
-	AppName string `json:"app_name"`
-	Start   int    `json:"time_start"`
-	End     int    `json:"time_end"`
+	AppName        string `json:"app_name"`
+	ExecutablePath string `json:"executable_path"`
+	Start          int    `json:"time_start"`
+	End            int    `json:"time_end"`
 }
 
 // Global variable to store app usage times
 var appUsageList []*AppUsageEntry
 
-func getForegroundWindowText() (string, error) {
-	hwnd, _, _ := procGetForegroundWindow.Call()
-	buf := make([]uint16, 256)
-	_, _, err := procGetWindowTextW.Call(hwnd, uintptr(unsafe.Pointer(&buf[0])), uintptr(len(buf)))
-	if err != nil && err.Error() != "The operation completed successfully." {
-		return "", err
-	}
-	return syscall.UTF16ToString(buf), nil
-}
-
+// Function to track the foreground window and capture usage data
 func trackForegroundWindow() {
 	saveCountdown := 0
 	lastApp := ""
@@ -55,40 +42,44 @@ func trackForegroundWindow() {
 
 		// Get the current foreground window title
 		currentApp, err := getForegroundWindowText()
+		exePath, _ := getActiveWindowExecutablePath()
+
 		if err != nil {
-			fmt.Println("Error getting foreground window:", err)
+			log.Println("Error getting foreground window title:", err)
 		} else {
-			if currentApp != "" {
+			if exePath != "" {
 				// If the foreground window has changed, update the time spent on the previous window
-				if currentApp != lastApp {
+				if exePath != lastApp {
 					appUsageList = append(appUsageList, &AppUsageEntry{
-						AppName: currentApp,
-						Start:   now,
-						End:     0,
+						AppName:        currentApp,
+						ExecutablePath: exePath,
+						Start:          now,
+						End:            0,
 					})
 				}
 
+				// Update the end time of the current app
 				appUsageList[len(appUsageList)-1].End = now
 
-				// Auto save to file every 10 minutes
+				// Auto save to file every 10 minutes (60 cycles of 10 seconds)
 				saveCountdown++
 				if saveCountdown > 60 {
 					saveCountdown = 0
 					err := saveAppUsageToFile()
 					if err != nil {
-						//
+						log.Println("Error saving app usage to file:", err)
 					}
 				}
 			}
 
-			lastApp = currentApp
+			lastApp = exePath
 		}
 		// Sleep for 10 seconds before checking again
 		time.Sleep(10 * time.Second)
 	}
 }
 
-// Function to save app usage data to a file
+// Function to save app usage data to a JSON file
 func saveAppUsageToFile() error {
 	// Get the executable path
 	ex, err := os.Executable()
@@ -96,6 +87,14 @@ func saveAppUsageToFile() error {
 		panic(err)
 	}
 	exPath := filepath.Dir(ex)
+
+	steamInfo, err := buildSteamInfo()
+	if err != nil {
+		// Output the file content
+		log.Println("Failed saving steaminfo file:", err)
+	} else {
+		err = os.WriteFile(exPath+"/steaminfo.json", []byte(steamInfo), 0777)
+	}
 
 	// Create a flat array to store all app usage entries
 	var flatAppUsageList []AppUsageEntry
@@ -116,20 +115,24 @@ func saveAppUsageToFile() error {
 	fileName := exPath + "/" + currentTime.Format("20060102150405") + ".json"
 
 	// Write the JSON data to a file
-	err = os.WriteFile(fileName, jsonData, 0644)
-	if err != nil {
-		// Saved? Clear usage map in memory
-		clear(appUsageList)
+	err = os.WriteFile(fileName, jsonData, 0777)
+	if err == nil {
+		// Clear usage list after successful save
+		appUsageList = nil
 	}
 	return err
 }
 
 func main() {
+	// Open a log file for appending (create if it doesn't exist)
+	logFile, err := os.OpenFile("app_errors.log", os.O_TRUNC|os.O_CREATE|os.O_WRONLY, 0644)
+	log.SetOutput(logFile)
+	log.Println("Start")
+
 	// Start tracking the foreground window in a separate goroutine
 	go trackForegroundWindow()
 
 	// We need either a walk.MainWindow or a walk.Dialog for their message loop.
-	// We will not make it visible in this example, though.
 	mw, err := walk.NewMainWindow()
 	if err != nil {
 		log.Fatal(err)
@@ -196,8 +199,9 @@ func main() {
 	exitAction.Triggered().Attach(func() {
 		err := saveAppUsageToFile()
 		if err != nil {
-			//
+			log.Println("Error saving on exit:", err)
 		}
+		log.Println("Clean exit")
 		walk.App().Exit(0)
 	})
 	if err := ni.ContextMenu().Actions().Add(exitAction); err != nil {

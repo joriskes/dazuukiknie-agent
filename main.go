@@ -1,9 +1,8 @@
 package main
 
 import (
-	_ "embed" // _ blank import trick
-	"encoding/json"
-	"fmt"
+	_ "embed"
+	"context"
 	"log"
 	"runtime"
 	"time"
@@ -17,129 +16,133 @@ var iconLinux []byte
 //go:embed assets/icon.ico
 var iconWindows []byte
 
-// Session holds the data for a single window activity period.
-type Session struct {
-	WindowTitle string    `json:"window_title"`
-	StartTime   time.Time `json:"start_time"`
-	EndTime     time.Time `json:"end_time"`
-	DurationSec float64   `json:"duration_seconds"`
-}
-
-// currentSession tracks the currently active window.
-var currentSession *Session
+var (
+	cfg    *Config
+	buf    *SessionBuffer
+	cancel context.CancelFunc
+)
 
 func main() {
 	systray.Run(onReady, onExit)
 }
 
 func onReady() {
+	var err error
+	cfg, err = loadConfig()
+	if err != nil {
+		log.Printf("Config load failed: %v, using defaults", err)
+		cfg = defaultConfig()
+	}
+
+	buf = newSessionBuffer()
+
 	if runtime.GOOS == "windows" {
 		systray.SetIcon(iconWindows)
 	} else {
 		systray.SetIcon(iconLinux)
 	}
+	systray.SetTooltip("Dazuukiknie Agent")
 
-	systray.SetTitle("dazuukiknie agent")
-	systray.SetTooltip("Dazuukiknie is gathering stats")
-	quitItem := systray.AddMenuItem("Quit", "Quit the application")
+	mStatus := systray.AddMenuItem("Not playing", "Currently detected game")
+	mStatus.Disable()
+	systray.AddSeparator()
+	mPush := systray.AddMenuItem("Push update", "Send pending sessions now")
+	systray.AddSeparator()
+	mQuit := systray.AddMenuItem("Quit", "Stop tracking")
 
-	// Start the window tracking in a separate goroutine
-	go startTracking()
+	ctx, cancelFn := context.WithCancel(context.Background())
+	cancel = cancelFn
 
-	// Handle quit button clicks
+	go runDetection(ctx, mStatus)
+	go runReporter(ctx)
+
 	go func() {
-		<-quitItem.ClickedCh
-		systray.Quit()
+		for {
+			select {
+			case <-mPush.ClickedCh:
+				go forcePush()
+			case <-mQuit.ClickedCh:
+				systray.Quit()
+			case <-ctx.Done():
+				return
+			}
+		}
 	}()
 }
 
 func onExit() {
-	// When the app is about to exit, end the final session and send it.
-	if currentSession != nil {
-		endCurrentSession()
-		log.Printf("Final session ended: %s (%.2f s)", currentSession.WindowTitle, currentSession.DurationSec)
-		sendSessionReport(*currentSession)
+	if cancel != nil {
+		cancel()
 	}
-	fmt.Println("Exiting application...")
+	buf.EndGame()
+	sessions := buf.Drain()
+	if err := sendReport(sessions, cfg); err != nil {
+		log.Printf("Final flush failed: %v", err)
+		buf.Restore(sessions)
+	}
 }
 
-// startTracking is the main loop that polls for the active window.
-func startTracking() {
-	// Poll for the active window every 2 seconds. Adjust as needed.
-	ticker := time.NewTicker(2 * time.Second)
+func runDetection(ctx context.Context, mStatus *systray.MenuItem) {
+	ticker := time.NewTicker(3 * time.Second)
 	defer ticker.Stop()
 
-	var lastTitle string
+	var current *DetectedGame
 
-	for range ticker.C {
-		title, err := getActiveWindow()
-		if err != nil {
-			log.Printf("Error getting active window: %v", err)
-			continue
-		}
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			detected := Detect(cfg)
 
-		// We only care about actual windows with titles.
-		if title == "" || title == "Default" { // "Default" can be an X11 default name
-			continue
-		}
-
-		// If the window title has changed...
-		if title != lastTitle {
-			log.Printf("Window changed to: '%s'", title)
-
-			// ...and if there was a previous session, end it and report it.
-			if currentSession != nil {
-				endCurrentSession()
-				log.Printf("Session ended: %s (%.2f s)", currentSession.WindowTitle, currentSession.DurationSec)
-				go sendSessionReport(*currentSession) // Send report in a goroutine
+			if detected == nil {
+				if current != nil {
+					log.Printf("Game ended: %s", current.Name)
+					buf.EndGame()
+					current = nil
+					mStatus.SetTitle("Not playing")
+				}
+				continue
 			}
 
-			// Start a new session for the new window.
-			startNewSession(title)
-			lastTitle = title
+			if current == nil || current.Name != detected.Name {
+				if current != nil {
+					buf.EndGame()
+				}
+				current = detected
+				buf.StartGame(Game{
+					Name:       detected.Name,
+					Source:     detected.Source,
+					SteamAppID: detected.SteamAppID,
+					Process:    detected.Process,
+				})
+				mStatus.SetTitle("Playing: " + detected.Name)
+				log.Printf("Game started: %s (%s)", detected.Name, detected.Source)
+			}
 		}
 	}
 }
 
-func startNewSession(title string) {
-	currentSession = &Session{
-		WindowTitle: title,
-		StartTime:   time.Now(),
+func runReporter(ctx context.Context) {
+	ticker := time.NewTicker(5 * time.Minute)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			if buf.HasPending() {
+				forcePush()
+			}
+		}
 	}
-	log.Printf("Session started: %s", title)
 }
 
-func endCurrentSession() {
-	if currentSession != nil {
-		currentSession.EndTime = time.Now()
-		currentSession.DurationSec = time.Since(currentSession.StartTime).Seconds()
+func forcePush() {
+	sessions := buf.Drain()
+	if err := sendReport(sessions, cfg); err != nil {
+		log.Printf("Report failed: %v", err)
+		buf.Restore(sessions)
 	}
-}
-
-// sendSessionReport sends the completed session data to your website.
-func sendSessionReport(session Session) {
-	// ❗ Replace this URL with your actual API endpoint.
-	//apiURL := "https://your-website.com/api/stats"
-
-	jsonData, err := json.Marshal(session)
-	if err != nil {
-		log.Printf("Error creating JSON data: %v", err)
-		return
-	}
-
-	log.Printf("Sending session report for: %s", session.WindowTitle)
-	log.Printf("JSON data: %s", string(jsonData))
-
-	//resp, err := http.Post(apiURL, "application/json", bytes.NewBuffer(jsonData))
-	//if err != nil {
-	//	log.Printf("Error sending session report: %v", err)
-	//	return
-	//}
-	//defer resp.Body.Close()
-	//
-	//if resp.StatusCode >= 300 {
-	//	log.Printf("API returned an error status: %s", resp.Status)
-	//} else {
-	//	log.Println("Session report sent successfully.")
-	//}
 }
